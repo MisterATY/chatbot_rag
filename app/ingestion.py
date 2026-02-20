@@ -592,8 +592,7 @@ def upload_qa_from_data(
     source: str = "qa",
 ) -> dict:
     """
-    Ingest question-answer pairs into the same collection.
-    Each pair is stored as one point; "text" = "Savol: ... Javob: ..." for retrieval.
+    Ingest question-answer pairs.
     """
     if not pairs:
         return {"ok": False, "message": "No pairs provided", "count": 0}

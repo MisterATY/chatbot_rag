@@ -2,8 +2,8 @@ import re
 import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
-from sentence_transformers import SentenceTransformer
-from app.config import QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, LLM_SERVER_URL, LLM_MODEL, EMBEDDING_MODEL
+from app.config import QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, LLM_SERVER_URL, LLM_MODEL
+from app.embeddings import embedding_model
 from app.tokenizer_util import count_tokens, get_tokenizer
 from app.reranker import rerank
 import numpy as np
@@ -12,7 +12,6 @@ import numpy as np
 # SETUP
 # -------------------------------
 client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
 # Retrieval constants (production RAG)
 RETRIEVAL_TOP_K = 12
@@ -220,12 +219,7 @@ def retrieve(
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
 ) -> list[str]:
     """
-    Retrieve context for RAG:
-    1. Get top_k chunks from Qdrant.
-    2. Find the best-scored chunk (rank 1).
-    3. Re-request neighbor chunks of that chunk (e.g. 162,163,164,165,166,167,168).
-    4. Merge those neighbors into one block.
-    5. Send to LLM: [merged block] + [other 11 chunks as separate blocks].
+    Retrieve context for RAG.
     """
     query_vector = embedding_model.encode(query, normalize_embeddings=True).tolist()
 
