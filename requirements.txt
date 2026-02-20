@@ -1,0 +1,19 @@
+# API server
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+
+# Vector DB
+qdrant-client>=1.7.0
+
+# Embeddings & reranker
+sentence-transformers>=2.2.0
+torch>=2.0.0
+transformers>=4.30.0
+
+# Utilities
+numpy>=1.24.0
+requests>=2.28.0
+
+# DOCX / TXT ingestion
+python-docx>=1.0.0

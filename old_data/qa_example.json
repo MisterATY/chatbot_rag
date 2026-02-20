@@ -1,0 +1,9 @@
+{
+  "source": "qa_example.json",
+  "pairs": [
+    {
+      "question": "o'rik qachon gullaydi",
+      "answer": "o'rik 2026 yil 1-yanvarda gullaydi"
+    }
+  ]
+}
