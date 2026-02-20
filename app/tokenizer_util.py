@@ -11,7 +11,7 @@ MAX_MODEL_TOKENS = 8192
 
 
 def _tokenizer_model():
-    if EMBEDDING_BACKEND == "qwen3-vl":
+    if EMBEDDING_BACKEND in ("qwen3", "qwen3-vl"):
         return QWEN_EMBEDDING_MODEL
     return EMBEDDING_MODEL
 

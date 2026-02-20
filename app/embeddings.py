@@ -33,6 +33,12 @@ class _QwenEncodeWrapper:
 def _get_embedding_model():
     if EMBEDDING_BACKEND == "qwen3-vl":
         return _QwenEncodeWrapper()
+    if EMBEDDING_BACKEND == "qwen3":
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer(
+            QWEN_EMBEDDING_MODEL,
+            model_kwargs={"low_cpu_mem_usage": True},
+        )
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer(
         EMBEDDING_MODEL,
