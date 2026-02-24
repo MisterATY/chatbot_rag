@@ -27,7 +27,15 @@ class _QwenGGUFWrapper:
     """Use Qwen3-Embedding-8B GGUF via llama-cpp-python. Same .encode(texts, normalize_embeddings=True) interface."""
 
     def __init__(self):
-        from llama_cpp import Llama
+        try:
+            from llama_cpp import Llama
+        except ImportError as e:
+            raise ImportError(
+                "QWEN_EMBEDDING_GGUF_PATH is set but 'llama-cpp-python' is not installed or failed to build. "
+                "Install a pre-built wheel: "
+                "CPU: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "
+                "CUDA: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"
+            ) from e
         # n_gpu_layers=-1 offloads all layers to GPU when built with CUDA/Metal
         self._llama = Llama(
             model_path=QWEN_EMBEDDING_GGUF_PATH.strip(),

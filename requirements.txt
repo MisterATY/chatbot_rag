@@ -11,8 +11,11 @@ sentence-transformers>=2.2.0
 torch>=2.0.0
 transformers>=4.57.0
 
-# Qwen3-Embedding GGUF (optional; used when QWEN_EMBEDDING_GGUF_PATH is set)
-llama-cpp-python>=0.2.0
+# Qwen3-Embedding GGUF: optional. Only needed when QWEN_EMBEDDING_GGUF_PATH is set.
+# On Windows, pip may fail to build; use a pre-built wheel instead:
+#   CPU:  pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+#   CUDA: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+# llama-cpp-python>=0.2.0
 
 # Utilities
 numpy>=1.24.0
