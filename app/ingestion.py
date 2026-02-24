@@ -13,6 +13,7 @@ from app.qdrant_db import client
 from app.embeddings import embedding_model
 from app.config import COLLECTION_NAME, VECTOR_SIZE
 from app.tokenizer_util import count_tokens, get_tokenizer, MAX_MODEL_TOKENS
+from app.file_registry import compute_file_hash, get_doc_id_by_hash, register_file
 from qdrant_client.models import PointStruct, VectorParams, Distance
 
 # -------------------------------
@@ -370,8 +371,8 @@ def estimate_tokens(text: str) -> int:
 def document_to_article_payloads(doc_id: str, full_text: str, source_label: str = "") -> list[dict]:
     """
     Convert a document (full text) into a list of payloads for Qdrant.
-    Each payload has: doc_id, article_id, article_title, chunk_index, total_chunks, text.
-    Articles <= 500 tokens become one point; longer articles are split with 500/50 token chunking.
+    Each payload has: doc_id, type="article", segment_id, title, chunk_index, total_chunks, text.
+    segment_id groups chunks for neighbor expansion (one per article/section).
     """
     articles = extract_articles(full_text)
     if DEBUG_INGESTION:
@@ -384,7 +385,7 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
             if DEBUG_INGESTION:
                 print(f"  [article {art_idx}] SKIP empty title={title!r}")
             continue
-        article_id = f"{doc_id}#art_{art_idx}"
+        segment_id = art_idx
         tokens = count_tokens(text)
         debug_label = f"art_{art_idx} {title!r}"
 
@@ -393,8 +394,9 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
                 print(f"  [article {art_idx}] title={title!r} tokens={tokens} -> SINGLE_POINT")
             payloads.append({
                 "doc_id": doc_id,
-                "article_id": article_id,
-                "article_title": title,
+                "type": "article",
+                "segment_id": segment_id,
+                "title": title,
                 "chunk_index": 0,
                 "total_chunks": 1,
                 "text": text,
@@ -412,8 +414,9 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
             for chunk_idx, chunk_text in enumerate(chunks):
                 payloads.append({
                     "doc_id": doc_id,
-                    "article_id": article_id,
-                    "article_title": title,
+                    "type": "article",
+                    "segment_id": segment_id,
+                    "title": title,
                     "chunk_index": chunk_idx,
                     "total_chunks": len(chunks),
                     "text": chunk_text,
@@ -461,11 +464,12 @@ def ingest_articles_from_text(full_text: str, doc_id: str, source_label: str = "
         print(f"[ingest_articles_from_text] building {len(payloads)} points...")
     points = []
     for i, (payload, vec) in enumerate(zip(payloads, vectors)):
-        # Payload for Qdrant: only stored fields (no 'source' required by spec but useful)
+        # Payload for Qdrant: type, segment_id, chunk_index for neighbor expansion
         p = {
             "doc_id": payload["doc_id"],
-            "article_id": payload["article_id"],
-            "article_title": payload["article_title"],
+            "type": payload.get("type", "article"),
+            "segment_id": payload.get("segment_id", 0),
+            "title": payload.get("title", ""),
             "chunk_index": payload["chunk_index"],
             "total_chunks": payload["total_chunks"],
             "text": payload["text"],
@@ -524,7 +528,17 @@ def upload_docx(file_path: str) -> dict:
         print(f"  ⚠️  Skipping {file_path}: document too short or empty")
         return {"ok": False, "message": "Document too short or empty", "filename": filename, "chunks": 0}
 
-    doc_id = str(os.path.abspath(file_path))
+    try:
+        file_hash = compute_file_hash(file_path)
+    except Exception as e:
+        print(f"  ❌ Error hashing file: {e}")
+        return {"ok": False, "message": str(e), "filename": filename, "chunks": 0}
+    existing_doc_id = get_doc_id_by_hash(file_hash)
+    if existing_doc_id is not None:
+        print(f"  ⏭️  Already ingested (same content): {filename}")
+        return {"ok": True, "skipped": True, "message": "Already ingested", "filename": filename, "chunks": 0}
+
+    doc_id = uuid.uuid4().hex
     source_label = filename
     try:
         points = ingest_articles_from_text(text, doc_id=doc_id, source_label=source_label)
@@ -547,6 +561,10 @@ def upload_docx(file_path: str) -> dict:
         except Exception as e:
             print(f"  ❌ Error uploading batch: {e}")
             return {"ok": False, "message": str(e), "filename": filename, "chunks": 0}
+    try:
+        register_file(doc_id=doc_id, file_path=file_path, file_hash=file_hash)
+    except Exception as e:
+        print(f"  ⚠️  Registry update failed: {e}")
     print(f"  ✅ Ingested {len(points)} points from {file_path}\n")
     return {"ok": True, "message": f"Ingested {filename}", "filename": filename, "chunks": len(points)}
 
@@ -570,13 +588,16 @@ def upload_file(file_path: str) -> dict:
             text = read_txt(file_path)
             if not text or len(text.strip()) < 50:
                 return {"ok": False, "message": "File too short or empty", "filename": filename}
-            doc_id = str(os.path.abspath(file_path))
+            file_hash = compute_file_hash(file_path)
+            if get_doc_id_by_hash(file_hash) is not None:
+                return {"ok": True, "skipped": True, "message": "Already ingested", "filename": filename, "chunks": 0}
+            doc_id = uuid.uuid4().hex
             points = ingest_articles_from_text(text, doc_id=doc_id, source_label=filename)
             if not points:
                 return {"ok": False, "message": "No article points created", "filename": filename}
             ensure_collection()
-            if points:
-                client.upsert(collection_name=COLLECTION_NAME, points=points)
+            client.upsert(collection_name=COLLECTION_NAME, points=points)
+            register_file(doc_id=doc_id, file_path=file_path, file_hash=file_hash)
             return {"ok": True, "message": f"Ingested {filename}", "filename": filename, "chunks": len(points)}
         except Exception as e:
             return {"ok": False, "message": str(e), "filename": filename}

@@ -35,12 +35,13 @@ def _payload_from_hit(hit) -> dict:
 
 
 def _is_article_chunk(payload: dict) -> bool:
-    """True if payload has article_id and chunk_index (article-based ingestion)."""
-    return isinstance(payload, dict) and "article_id" in payload and "chunk_index" in payload
+    """True if payload is article type with chunk_index (for neighbor expansion)."""
+    return isinstance(payload, dict) and payload.get("type") == "article" and "chunk_index" in payload
+
 
 def _is_question_answerable(payload: dict) -> bool:
-    """True if payload has article_id and chunk_index (article-based ingestion)."""
-    return isinstance(payload, dict) and "type" in payload and payload["type"] == "qa"
+    """True if payload is QA type."""
+    return isinstance(payload, dict) and payload.get("type") == "qa"
 
 
 # -------------------------------
@@ -274,18 +275,20 @@ def retrieve(
             block = f"[Article – – Part 1/1]\n{text}"
         return [block]
 
-    article_id = best_payload.get("article_id", "")
-    article_title = best_payload.get("article_title", "")
+    doc_id = best_payload.get("doc_id", "")
+    segment_id = best_payload.get("segment_id", 0)
+    title = best_payload.get("title", "")
     total_chunks = best_payload.get("total_chunks", 1)
     center = best_payload.get("chunk_index", 0)
 
-    # Neighbor chunks: single filter query (article_id + chunk_index in [center-3, center+3])
+    # Neighbor chunks: same doc_id + segment_id, chunk_index in [center-before, center+after]
     if total_chunks <= 1:
         neighbor_chunks = [best_payload]
     else:
         neighbor_filter = Filter(
             must=[
-                FieldCondition(key="article_id", match=MatchValue(value=article_id)),
+                FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="segment_id", match=MatchValue(value=segment_id)),
                 FieldCondition(
                     key="chunk_index",
                     range=Range(gte=center - NEIGHBOR_CHUNKS_BEFORE, lte=center + NEIGHBOR_CHUNKS_AFTER),
@@ -303,8 +306,8 @@ def retrieve(
         neighbor_chunks = [p for p in neighbor_chunks if _is_article_chunk(p)]
         neighbor_chunks.sort(key=lambda p: p.get("chunk_index", 0))
 
-    # Merged set: (article_id, chunk_index) for everything in the first block
-    merged_set = {(p.get("article_id"), p.get("chunk_index")) for p in neighbor_chunks}
+    # Merged set: (doc_id, segment_id, chunk_index) for everything in the first block
+    merged_set = {(p.get("doc_id"), p.get("segment_id"), p.get("chunk_index")) for p in neighbor_chunks}
 
     # First block: merge neighbor chunks into one block
     neighbor_texts = [p.get("text", "") for p in neighbor_chunks]
@@ -317,7 +320,7 @@ def retrieve(
     index = 2
     for hit in points[1:]:
         pl = _payload_from_hit(hit)
-        key = (pl.get("article_id"), pl.get("chunk_index"))
+        key = (pl.get("doc_id"), pl.get("segment_id"), pl.get("chunk_index"))
         if key in merged_set:
             continue
         remaining_blocks.append(_format_single_block(pl, index))
