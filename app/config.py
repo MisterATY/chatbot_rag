@@ -9,7 +9,7 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-4B"
 # Device for embedding: "cuda", "cpu", or None (auto: use cuda if available)
 EMBEDDING_DEVICE = None
-# Optional: path to Qwen3-Embedding-8B GGUF file (e.g. Qwen3-Embedding-8B-Q4_K_M.gguf). If set, use llama-cpp-python for embedding instead of HF.
+# GGUF embedding: set to a .gguf file path to use llama-cpp-python; leave "" to use HuggingFace model above. Only one is used.
 QWEN_EMBEDDING_GGUF_PATH = ""  # e.g. "models/Qwen3-Embedding-8B-Q4_K_M.gguf"
 # Vector dimension: bge-m3 1024; qwen3 0.6B 1024, 4B 2560, 8B 4096
 VECTOR_SIZE = (

@@ -79,7 +79,6 @@ def _get_embedding_model():
     # Force model onto device (some versions load on CPU first)
     device_obj = torch.device(device)
     model = model.to(device_obj)
-    model.device = device_obj
     print(f"[embeddings] Using device: {device} for {model.__class__.__name__}")
     return model
 
