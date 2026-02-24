@@ -5,6 +5,7 @@ import numpy as np
 
 from app.config import (
     EMBEDDING_BACKEND,
+    EMBEDDING_DEVICE,
     EMBEDDING_MODEL,
     QWEN_EMBEDDING_GGUF_PATH,
     QWEN_EMBEDDING_MODEL,
@@ -12,7 +13,9 @@ from app.config import (
 
 
 def _embedding_device():
-    """Use GPU for embedding if available."""
+    """Device for embedding: config override, or cuda if available else cpu."""
+    if EMBEDDING_DEVICE is not None and str(EMBEDDING_DEVICE).strip():
+        return str(EMBEDDING_DEVICE).strip().lower()
     try:
         import torch
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -49,20 +52,28 @@ class _QwenGGUFWrapper:
 def _get_embedding_model():
     if EMBEDDING_BACKEND == "qwen3" and QWEN_EMBEDDING_GGUF_PATH and QWEN_EMBEDDING_GGUF_PATH.strip():
         return _QwenGGUFWrapper()
+    import torch
     device = _embedding_device()
     if EMBEDDING_BACKEND == "qwen3":
         from sentence_transformers import SentenceTransformer
-        return SentenceTransformer(
+        model = SentenceTransformer(
             QWEN_EMBEDDING_MODEL,
             device=device,
             model_kwargs={"low_cpu_mem_usage": True},
         )
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(
-        EMBEDDING_MODEL,
-        device=device,
-        model_kwargs={"low_cpu_mem_usage": True},
-    )
+    else:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(
+            EMBEDDING_MODEL,
+            device=device,
+            model_kwargs={"low_cpu_mem_usage": True},
+        )
+    # Force model onto device (some versions load on CPU first)
+    device_obj = torch.device(device)
+    model = model.to(device_obj)
+    model.device = device_obj
+    print(f"[embeddings] Using device: {device} for {model.__class__.__name__}")
+    return model
 
 
 embedding_model = _get_embedding_model()
