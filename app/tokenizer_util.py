@@ -1,6 +1,6 @@
 """
 Shared token counting for ingestion and retrieval.
-Uses the tokenizer of the active embedding backend (bge-m3 or qwen3-vl).
+Uses the tokenizer of the active embedding backend (bge-m3 or qwen3).
 """
 from functools import lru_cache
 
@@ -11,7 +11,7 @@ MAX_MODEL_TOKENS = 8192
 
 
 def _tokenizer_model():
-    if EMBEDDING_BACKEND in ("qwen3", "qwen3-vl"):
+    if EMBEDDING_BACKEND == "qwen3":
         return QWEN_EMBEDDING_MODEL
     return EMBEDDING_MODEL
 
