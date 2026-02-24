@@ -364,7 +364,7 @@ Javob:"""
         "messages": [
             {
                 "role": "system",
-                "content": f"""You are an AI assistant specialized in customs and customs legislation.
+                "content": f"""No reasoning. You are an AI assistant specialized in customs and customs legislation.
 
 Rules:
 1. You answer ONLY questions related to customs and customs legislation.
