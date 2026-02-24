@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 from qdrant_client import QdrantClient
@@ -39,9 +40,83 @@ def _is_article_chunk(payload: dict) -> bool:
     return isinstance(payload, dict) and payload.get("type") == "article" and "chunk_index" in payload
 
 
+def _is_document_or_article_chunk(payload: dict) -> bool:
+    """True if payload is article or document type with chunk_index (for neighbor expansion)."""
+    return (
+        isinstance(payload, dict)
+        and payload.get("type") in ("article", "document")
+        and "chunk_index" in payload
+    )
+
+
 def _is_question_answerable(payload: dict) -> bool:
     """True if payload is QA type."""
     return isinstance(payload, dict) and payload.get("type") == "qa"
+
+
+def _fetch_and_join_document_group(doc_id: str, group_id: int) -> str:
+    """
+    Fetch all chunks with the same (doc_id, group_id) from Qdrant, sort by chunk_index.
+    For paragraphs: join text. For tables: merge table_data (rows) and return JSON string.
+    """
+    filter_ = Filter(
+        must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="group_id", match=MatchValue(value=group_id)),
+        ]
+    )
+    points, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=filter_,
+        with_payload=True,
+        with_vectors=False,
+        limit=100,
+    )
+    payloads = [_payload_from_hit(p) for p in points]
+    payloads = [p for p in payloads if p.get("type") == "document" and p.get("group_id") == group_id]
+    payloads.sort(key=lambda p: p.get("chunk_index", 0))
+    if payloads and payloads[0].get("table"):
+        if all(p.get("table_data") is not None for p in payloads):
+            merged_rows = []
+            for p in payloads:
+                merged_rows.extend(p.get("table_data") or [])
+            return json.dumps(merged_rows, ensure_ascii=False)
+        return "\n\n".join(p.get("text", "") for p in payloads)
+    return "\n\n".join(p.get("text", "") for p in payloads)
+
+
+def _fetch_neighbor_chunks_joined(
+    doc_id: str,
+    segment_id: int,
+    center_chunk_index: int,
+    before: int = NEIGHBOR_CHUNKS_BEFORE,
+    after: int = NEIGHBOR_CHUNKS_AFTER,
+) -> str:
+    """
+    Gather neighbor chunks using scroll (doc_id + segment_id + chunk_index range), join text.
+    Used for article chunks that don't use group_id.
+    """
+    filter_ = Filter(
+        must=[
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            FieldCondition(key="segment_id", match=MatchValue(value=segment_id)),
+            FieldCondition(
+                key="chunk_index",
+                range=Range(gte=center_chunk_index - before, lte=center_chunk_index + after),
+            ),
+        ]
+    )
+    points, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=filter_,
+        with_payload=True,
+        with_vectors=False,
+        limit=before + 1 + after,
+    )
+    payloads = [_payload_from_hit(p) for p in points]
+    payloads = [p for p in payloads if _is_document_or_article_chunk(p)]
+    payloads.sort(key=lambda p: p.get("chunk_index", 0))
+    return "\n\n".join(p.get("text", "") for p in payloads)
 
 
 # -------------------------------
@@ -251,7 +326,7 @@ def retrieve(
     best = points[0]
     best_payload = _payload_from_hit(best)
 
-    if not _is_article_chunk(best_payload):
+    if not _is_document_or_article_chunk(best_payload):
         # Legacy: single chunk
         if _is_question_answerable(best_payload):
             text = best_payload.get("text", "")
@@ -275,58 +350,49 @@ def retrieve(
             block = f"[Article – – Part 1/1]\n{text}"
         return [block]
 
-    doc_id = best_payload.get("doc_id", "")
-    segment_id = best_payload.get("segment_id", 0)
-    title = best_payload.get("title", "")
-    total_chunks = best_payload.get("total_chunks", 1)
-    center = best_payload.get("chunk_index", 0)
+    # Build block items in reranked order: each item is a group (scroll by group_id) or a single chunk.
+    # Grouped points (doc_id, group_id) are gathered via scroll and joined into one block.
+    block_items = []
+    seen_groups = set()
 
-    # Neighbor chunks: same doc_id + segment_id, chunk_index in [center-before, center+after]
-    if total_chunks <= 1:
-        neighbor_chunks = [best_payload]
-    else:
-        neighbor_filter = Filter(
-            must=[
-                FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
-                FieldCondition(key="segment_id", match=MatchValue(value=segment_id)),
-                FieldCondition(
-                    key="chunk_index",
-                    range=Range(gte=center - NEIGHBOR_CHUNKS_BEFORE, lte=center + NEIGHBOR_CHUNKS_AFTER),
-                ),
-            ]
-        )
-        points_neighbors, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=neighbor_filter,
-            with_payload=True,
-            with_vectors=False,
-            limit=NEIGHBOR_CHUNKS_BEFORE + 1 + NEIGHBOR_CHUNKS_AFTER,
-        )
-        neighbor_chunks = [_payload_from_hit(p) for p in points_neighbors]
-        neighbor_chunks = [p for p in neighbor_chunks if _is_article_chunk(p)]
-        neighbor_chunks.sort(key=lambda p: p.get("chunk_index", 0))
-
-    # Merged set: (doc_id, segment_id, chunk_index) for everything in the first block
-    merged_set = {(p.get("doc_id"), p.get("segment_id"), p.get("chunk_index")) for p in neighbor_chunks}
-
-    # First block: merge neighbor chunks into one block
-    neighbor_texts = [p.get("text", "") for p in neighbor_chunks]
-    ci_min = min(p.get("chunk_index", 0) for p in neighbor_chunks)
-    ci_max = max(p.get("chunk_index", 0) for p in neighbor_chunks)
-    merged_block = "\n\n".join(neighbor_texts)
-
-    # Remaining blocks: other top_k chunks not in merged set (each as separate block)
-    remaining_blocks = []
-    index = 2
-    for hit in points[1:]:
-        pl = _payload_from_hit(hit)
-        key = (pl.get("doc_id"), pl.get("segment_id"), pl.get("chunk_index"))
-        if key in merged_set:
+    for i, point in enumerate(points):
+        pl = _payload_from_hit(point)
+        if not _is_document_or_article_chunk(pl):
+            block_items.append(("single", pl))
             continue
-        remaining_blocks.append(_format_single_block(pl, index))
-        index += 1
+        if (
+            pl.get("type") == "document"
+            and pl.get("group_id") is not None
+            and pl.get("group_id") != -1
+        ):
+            dg = (pl.get("doc_id", ""), pl.get("group_id"))
+            if dg not in seen_groups:
+                seen_groups.add(dg)
+                block_items.append(("group", pl.get("doc_id", ""), pl.get("group_id")))
+            continue
+        if i == 0 and pl.get("total_chunks", 1) > 1:
+            block_items.append(("article_neighbor", pl))
+        else:
+            block_items.append(("single", pl))
 
-    context_blocks = [f"Context 1: \n{merged_block}"] + remaining_blocks
+    context_blocks = []
+    for idx, item in enumerate(block_items):
+        block_num = idx + 1
+        if item[0] == "group":
+            _, doc_id, group_id = item
+            joined = _fetch_and_join_document_group(doc_id, group_id)
+            context_blocks.append(f"Context {block_num}: \n{joined}")
+        elif item[0] == "article_neighbor":
+            _, pl = item
+            joined = _fetch_neighbor_chunks_joined(
+                pl.get("doc_id", ""),
+                pl.get("segment_id", 0),
+                pl.get("chunk_index", 0),
+            )
+            context_blocks.append(f"Context {block_num}: \n{joined}")
+        else:
+            _, pl = item
+            context_blocks.append(_format_single_block(pl, block_num))
 
     # Trim to max_context_tokens (drop blocks from the end)
     total = sum(count_tokens(b) for b in context_blocks)
@@ -390,7 +456,7 @@ Your task is to provide a reliable, context-based answer to the given question."
         ],
         "max_tokens": 4096,
         "stream": False,
-        "model": "bojxona",
+        "model": "bojxona3-14b.gguf",
         "temperature": 0.7
     }
     # 6. Javobni aniq, qisqa va rasmiy-uslubda yozing.

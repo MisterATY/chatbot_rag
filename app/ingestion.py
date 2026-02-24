@@ -4,6 +4,7 @@ import sys
 import traceback
 import uuid
 import re
+import numpy as np
 from docx import Document
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
@@ -19,17 +20,34 @@ from qdrant_client.models import PointStruct, VectorParams, Distance
 # -------------------------------
 # CONFIG
 # -------------------------------
-DATA_FOLDER = "data"  # folder containing your .docx and .txt files
+DATA_FOLDER = "data"
+# Legislation: articles (1-modda, 2-modda) = one point each; normal docs = chunked by tokens
+DATA_ARTICLES_FOLDER = "data/articles"   # each article (modda) stored as single chunk
+DATA_DOCUMENTS_FOLDER = "data/documents"  # normal text/table, chunked by token size
 
 # Article-based chunking (legislation): chunk size in tokens
-ARTICLE_CHUNK_SIZE_TOKENS = 700
+ARTICLE_CHUNK_SIZE_TOKENS = 500
 ARTICLE_CHUNK_OVERLAP_TOKENS = 50
 ARTICLE_MAX_SINGLE_POINT_TOKENS = 500  # articles <= this stored as one point
 # Avoid MemoryError when doc has many tiny "sentences" (e.g. few sentence boundaries)
 MAX_SENTENCES_PER_CHUNK = 2000
+# Trailing fragment from word-split below this (tokens) is merged into previous chunk to avoid tiny chunks
+MIN_CHUNK_TOKENS = 300
+# Normal documents: paragraph below this (tokens) = one chunk with group_id=-1; above = split with same group_id
+DOCUMENT_PARAGRAPH_CHUNK_SIZE = 500
+# Table storage: "json" or "markdown"; chunked by token size (DOCUMENT_PARAGRAPH_CHUNK_SIZE), never exceed chunk size
+TABLE_STORE_FORMAT = "json"
+# Section headers for document paragraphs: 1-bob, 2-bob, 3-bo'lim, etc. (case-insensitive)
+DOCUMENT_SECTION_HEADER_PATTERN = re.compile(
+    r"(?m)^\s*\d+[\-\.]?\s*(?:bob|bo'lim)[\s\.\-]",
+    re.IGNORECASE,
+)
 
 # Set True to print per-article and per-step details (find infinite loops / repeating steps)
 DEBUG_INGESTION = True
+# Encode embeddings in batches to avoid RAM crash on large docs; batch size when True
+EMBED_BY_CHUNK = False
+EMBED_BATCH_SIZE = 50
 
 # Legacy word-based chunking (kept for non-article flow if needed)
 CHUNK_SIZE = 500
@@ -74,6 +92,31 @@ def read_docx(path: str) -> str:
     return "\n".join(text_parts)
 
 
+def read_docx_elements(path: str) -> list[dict]:
+    """
+    Read DOCX and return elements in order: paragraphs and tables.
+    Each element is {"type": "paragraph", "text": str} or {"type": "table", "data": list[list[str]]} (rows of cell values).
+    """
+    doc = Document(path)
+    elements = []
+    for element in doc.element.body:
+        if isinstance(element, CT_P):
+            para = Paragraph(element, doc)
+            text = para.text.strip()
+            if text:
+                elements.append({"type": "paragraph", "text": text})
+        elif isinstance(element, CT_Tbl):
+            table = Table(element, doc)
+            rows = []
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                elements.append({"type": "table", "data": rows})
+    return elements
+
+
 def split_into_sentences(text: str) -> list[str]:
     """Split text into sentences (handles Uzbek text)."""
     # Split by sentence endings, preserving the punctuation
@@ -97,9 +140,9 @@ def split_into_sentences(text: str) -> list[str]:
 # -------------------------------
 # ARTICLE EXTRACTION (legislation)
 # -------------------------------
-# Pattern to detect article boundaries: Modda N, Article N, § N (Uzbek/English/common legal)
+# Pattern to detect article boundaries: 1-modda, 2-modda, Modda N, Article N, § N (Uzbek/English/common legal)
 _ARTICLE_HEADER_PATTERN = re.compile(
-    r"(?m)^(Modda\s+\d+[\.\-]?|Article\s+\d+[\.\-]?|§\s*\d+[\.\-]?)\s*",
+    r"(?m)^(\d+[\-\.]?\s*modda[\s\.\-]*|Modda\s+\d+[\.\-]?|Article\s+\d+[\.\-]?|§\s*\d+[\.\-]?)\s*",
     re.IGNORECASE,
 )
 
@@ -141,6 +184,8 @@ def chunk_article_by_tokens(
     Split article text into chunks by token count. Respects sentence boundaries
     and never splits mid-word. Uses overlap between consecutive chunks.
     """
+    chunk_size = max(1, chunk_size)
+    overlap = min(overlap, chunk_size - 1) if chunk_size > 1 else 0
     sentences = split_into_sentences(text)
     if not sentences:
         return [text] if text.strip() else []
@@ -159,8 +204,15 @@ def chunk_article_by_tokens(
     i = 0
     _last_log = None
     _repeat_count = 0
+    max_iter = max(len(sentences) * 3, 10000)
 
     while i < len(sentences):
+        if i >= max_iter:
+            if DEBUG_INGESTION and debug_label:
+                print(f"  [chunk_article] {debug_label} | SAFETY: flushing remainder at i={i} (max_iter={max_iter})")
+            current_chunk_sentences.extend(sentences[i:])
+            i = len(sentences)
+            break
         sent = sentences[i]
         tok = sent_tokens[i]
 
@@ -195,7 +247,11 @@ def chunk_article_by_tokens(
                 segment_words.append(w)
                 segment_tokens += w_tok
             if segment_words:
-                chunks.append(" ".join(segment_words))
+                tail_text = " ".join(segment_words)
+                if segment_tokens < MIN_CHUNK_TOKENS and chunks:
+                    chunks[-1] = chunks[-1] + " " + tail_text
+                else:
+                    chunks.append(tail_text)
             i += 1
             continue
 
@@ -254,7 +310,16 @@ def chunk_article_by_tokens(
                     segment_words.append(w)
                     segment_tokens += w_tok
                 if segment_words:
-                    chunks.append(" ".join(segment_words))
+                    tail_text = " ".join(segment_words)
+                    if segment_tokens < MIN_CHUNK_TOKENS and chunks:
+                        chunks[-1] = chunks[-1] + " " + tail_text
+                    else:
+                        chunks.append(tail_text)
+                i += 1
+            else:
+                # Sentence fits with overlap; add it and advance to avoid infinite loop
+                current_chunk_sentences.append(sent)
+                current_tokens += tok
                 i += 1
         else:
             if DEBUG_INGESTION and debug_label and (i < 5 or i % 500 == 0 or i == len(sentences) - 1):
@@ -366,17 +431,215 @@ def estimate_tokens(text: str) -> int:
 
 
 # -------------------------------
+# NORMAL DOCUMENTS (section-based paragraphs: bob, bo'lim; group_id = first chunk index or -1)
+# -------------------------------
+def split_document_into_section_paragraphs(full_text: str) -> list[str]:
+    """
+    Split document into paragraphs by section headers: 1-bob, 2-bob, 3-bo'lim, etc.
+    Each paragraph starts at a header or at the start of the document (intro).
+    """
+    full_text = full_text.strip()
+    if not full_text:
+        return []
+    matches = list(DOCUMENT_SECTION_HEADER_PATTERN.finditer(full_text))
+    if not matches:
+        return [full_text]
+    paragraphs = []
+    # Intro before first header
+    if matches[0].start() > 0:
+        intro = full_text[: matches[0].start()].strip()
+        if intro:
+            paragraphs.append(intro)
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+        part = full_text[start:end].strip()
+        if part:
+            paragraphs.append(part)
+    return paragraphs
+
+
+def table_data_to_string(data: list[list[str]], fmt: str = "json") -> str:
+    """
+    Convert table rows to a single string for storage. fmt: "json" or "markdown".
+    Chunking will be done by token size so the string is not limited here.
+    """
+    if fmt == "markdown":
+        if not data:
+            return ""
+        lines = []
+        for i, row in enumerate(data):
+            cells = [str(c).replace("|", "\\|").replace("\n", " ") for c in row]
+            lines.append("| " + " | ".join(cells) + " |")
+            if i == 0:
+                lines.append("| " + " | ".join("---" for _ in row) + " |")
+        return "\n".join(lines)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def elements_to_blocks(elements: list[dict]) -> list[dict]:
+    """
+    Convert DOCX elements (paragraphs + tables) into blocks: section text blocks and table blocks.
+    Section paragraphs are grouped by bob/bo'lim headers; each table is its own block with separate group_id.
+    Returns list of {"type": "section", "text": str} or {"type": "table", "data": list[list[str]]}.
+    """
+    blocks = []
+    section_lines = []
+    for el in elements:
+        if el["type"] == "paragraph":
+            line = el["text"]
+            if not line.strip():
+                continue
+            if section_lines and DOCUMENT_SECTION_HEADER_PATTERN.match(line):
+                blocks.append({"type": "section", "text": "\n\n".join(section_lines)})
+                section_lines = [line]
+            else:
+                section_lines.append(line)
+        elif el["type"] == "table":
+            if section_lines:
+                blocks.append({"type": "section", "text": "\n\n".join(section_lines)})
+                section_lines = []
+            blocks.append({"type": "table", "data": el["data"]})
+    if section_lines:
+        blocks.append({"type": "section", "text": "\n\n".join(section_lines)})
+    return blocks
+
+
+def document_to_document_payloads(
+    doc_id: str,
+    full_text: str | None = None,
+    source_label: str = "",
+    elements: list[dict] | None = None,
+) -> list[dict]:
+    """
+    For normal documents (data/documents).
+    If elements is provided (from DOCX): sections by bob/bo'lim + tables as JSON; tables get separate group_id.
+    If full_text is provided (from TXT): split by section headers only.
+    - Single-chunk block: group_id=-1. Multi-chunk block: group_id = first chunk's global index.
+    """
+    if elements is not None:
+        blocks = elements_to_blocks(elements)
+        if DEBUG_INGESTION:
+            print(f"[document_to_document_payloads] blocks from elements: {len(blocks)}")
+    else:
+        if full_text is None:
+            full_text = ""
+        paragraphs = split_document_into_section_paragraphs(full_text)
+        if DEBUG_INGESTION:
+            print(f"[document_to_document_payloads] section paragraphs={len(paragraphs)}")
+        blocks = [{"type": "section", "text": p} for p in paragraphs]
+
+    payloads = []
+    table_group_counter = 0  # separate group_id space for tables (negative: -2, -3, ...)
+    for block in blocks:
+        if block["type"] == "section":
+            para = block["text"]
+            tokens = count_tokens(para)
+            if tokens <= DOCUMENT_PARAGRAPH_CHUNK_SIZE:
+                payloads.append({
+                    "doc_id": doc_id,
+                    "type": "document",
+                    "segment_id": 0,
+                    "title": "",
+                    "chunk_index": len(payloads),
+                    "total_chunks": 0,
+                    "group_id": -1,
+                    "text": para,
+                    "source": source_label,
+                })
+            else:
+                chunks = chunk_article_by_tokens(
+                    para,
+                    chunk_size=DOCUMENT_PARAGRAPH_CHUNK_SIZE,
+                    overlap=ARTICLE_CHUNK_OVERLAP_TOKENS,
+                    debug_label="doc_section",
+                )
+                first_chunk_index = len(payloads)
+                for chunk_text in chunks:
+                    payloads.append({
+                        "doc_id": doc_id,
+                        "type": "document",
+                        "segment_id": 0,
+                        "title": "",
+                        "chunk_index": len(payloads),
+                        "total_chunks": 0,
+                        "group_id": first_chunk_index,
+                        "text": chunk_text,
+                        "source": source_label,
+                    })
+        else:
+            data = block["data"]
+            table_str = table_data_to_string(data, TABLE_STORE_FORMAT)
+            tokens = count_tokens(table_str)
+            num_rows = len(data)
+            if DEBUG_INGESTION:
+                print(f"[document_to_document_payloads] [TABLE] rows={num_rows} tokens={tokens} format={TABLE_STORE_FORMAT} str_len={len(table_str)}")
+            if tokens <= DOCUMENT_PARAGRAPH_CHUNK_SIZE:
+                if DEBUG_INGESTION:
+                    print(f"[document_to_document_payloads]   -> single chunk group_id=-1 payload_idx={len(payloads)} (within chunk size)")
+                payloads.append({
+                    "doc_id": doc_id,
+                    "type": "document",
+                    "segment_id": 0,
+                    "title": "",
+                    "chunk_index": len(payloads),
+                    "total_chunks": 0,
+                    "group_id": -1,
+                    "text": table_str,
+                    "table": True,
+                    "table_data": data,
+                    "source": source_label,
+                })
+            else:
+                table_group_counter += 1
+                table_group_id = -(table_group_counter + 1)
+                chunks = chunk_article_by_tokens(
+                    table_str,
+                    chunk_size=DOCUMENT_PARAGRAPH_CHUNK_SIZE,
+                    overlap=ARTICLE_CHUNK_OVERLAP_TOKENS,
+                    debug_label="table",
+                )
+                if DEBUG_INGESTION:
+                    print(f"[document_to_document_payloads]   -> multi-chunk group_id={table_group_id} num_chunks={len(chunks)} payload_idx_from={len(payloads)} (token-split, max chunk size)")
+                for chunk_text in chunks:
+                    if DEBUG_INGESTION:
+                        print(f"[document_to_document_payloads]     table chunk payload_idx={len(payloads)} text_len={len(chunk_text)}")
+                    payloads.append({
+                        "doc_id": doc_id,
+                        "type": "document",
+                        "segment_id": 0,
+                        "title": "",
+                        "chunk_index": len(payloads),
+                        "total_chunks": 0,
+                        "group_id": table_group_id,
+                        "text": chunk_text,
+                        "table": True,
+                        "source": source_label,
+                    })
+    n = len(payloads)
+    for p in payloads:
+        p["total_chunks"] = n
+    return payloads
+
+
+# -------------------------------
 # ARTICLE-BASED INGESTION
 # -------------------------------
-def document_to_article_payloads(doc_id: str, full_text: str, source_label: str = "") -> list[dict]:
+def document_to_article_payloads(
+    doc_id: str,
+    full_text: str,
+    source_label: str = "",
+    one_article_per_point: bool = False,
+) -> list[dict]:
     """
     Convert a document (full text) into a list of payloads for Qdrant.
-    Each payload has: doc_id, type="article", segment_id, title, chunk_index, total_chunks, text.
-    segment_id groups chunks for neighbor expansion (one per article/section).
+    - one_article_per_point=True (article files): type="article", one point per modda; chunk_index 0..N-1, total_chunks=N.
+    - one_article_per_point=False (normal docs): type="document", chunked by token size.
     """
+    content_type = "article" if one_article_per_point else "document"
     articles = extract_articles(full_text)
     if DEBUG_INGESTION:
-        print(f"[document_to_article_payloads] total_articles={len(articles)}")
+        print(f"[document_to_article_payloads] total_articles={len(articles)} one_article_per_point={one_article_per_point} type={content_type}")
     payloads = []
     for art_idx, art in enumerate(articles):
         title = art["title"]
@@ -389,16 +652,16 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
         tokens = count_tokens(text)
         debug_label = f"art_{art_idx} {title!r}"
 
-        if tokens <= ARTICLE_MAX_SINGLE_POINT_TOKENS:
+        if one_article_per_point or tokens <= ARTICLE_MAX_SINGLE_POINT_TOKENS:
             if DEBUG_INGESTION:
                 print(f"  [article {art_idx}] title={title!r} tokens={tokens} -> SINGLE_POINT")
             payloads.append({
                 "doc_id": doc_id,
-                "type": "article",
+                "type": content_type,
                 "segment_id": segment_id,
                 "title": title,
-                "chunk_index": 0,
-                "total_chunks": 1,
+                "chunk_index": len(payloads),
+                "total_chunks": 0,
                 "text": text,
                 "source": source_label,
             })
@@ -414,7 +677,7 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
             for chunk_idx, chunk_text in enumerate(chunks):
                 payloads.append({
                     "doc_id": doc_id,
-                    "type": "article",
+                    "type": content_type,
                     "segment_id": segment_id,
                     "title": title,
                     "chunk_index": chunk_idx,
@@ -422,17 +685,35 @@ def document_to_article_payloads(doc_id: str, full_text: str, source_label: str 
                     "text": chunk_text,
                     "source": source_label,
                 })
+    if one_article_per_point and payloads:
+        n = len(payloads)
+        for i, p in enumerate(payloads):
+            p["chunk_index"] = i
+            p["total_chunks"] = n
     return payloads
 
 
-def ingest_articles_from_text(full_text: str, doc_id: str, source_label: str = "") -> list[PointStruct]:
+def ingest_articles_from_text(
+    full_text: str | None = None,
+    doc_id: str = "",
+    source_label: str = "",
+    one_article_per_point: bool = False,
+    elements: list[dict] | None = None,
+) -> list[PointStruct]:
     """
-    Build Qdrant points (with vectors) from document text using article-based chunking.
-    Returns list of PointStruct ready for upsert.
+    Build Qdrant points (with vectors) from document text or DOCX elements.
+    one_article_per_point=True: each article (1-modda, 2-modda) = one point even if long (truncated at encode).
+    For normal docs from DOCX, pass elements=read_docx_elements(path); for TXT pass full_text.
     """
     if DEBUG_INGESTION:
-        print(f"[ingest_articles_from_text] doc_id={doc_id!r} building payloads...")
-    payloads = document_to_article_payloads(doc_id, full_text, source_label)
+        print(f"[ingest_articles_from_text] doc_id={doc_id!r} one_article_per_point={one_article_per_point} building payloads...")
+    if one_article_per_point:
+        payloads = document_to_article_payloads(doc_id, full_text or "", source_label, one_article_per_point=True)
+    else:
+        if elements is not None:
+            payloads = document_to_document_payloads(doc_id, full_text=None, source_label=source_label, elements=elements)
+        else:
+            payloads = document_to_document_payloads(doc_id, full_text=full_text or "", source_label=source_label)
 
     if DEBUG_INGESTION:
         print(f"[ingest_articles_from_text] payloads={len(payloads)}")
@@ -446,13 +727,42 @@ def ingest_articles_from_text(full_text: str, doc_id: str, source_label: str = "
     texts = []
     for i, p in enumerate(payloads):
         t = p["text"]
+        if p.get("table"):
+            t_len = len(t)
+            preview = (t[:300] + "...") if t_len > 300 else t
+            if DEBUG_INGESTION:
+                print(f"[ingest_articles_from_text]   [TABLE] payload_idx={i} chunk_index={p.get('chunk_index')} group_id={p.get('group_id')} text_len={t_len} preview={preview!r}")
         ids = tokenizer.encode(t, add_special_tokens=False, max_length=MAX_MODEL_TOKENS, truncation=True)
         texts.append(tokenizer.decode(ids, skip_special_tokens=True) if ids else t)
-        if DEBUG_INGESTION and (i + 1) % 50 == 0:
+        if DEBUG_INGESTION and not p.get("table") and (i + 1) % 50 == 0:
             print(f"[ingest_articles_from_text]   truncation progress: {i + 1}/{len(payloads)}")
+    table_count = sum(1 for p in payloads if p.get("table"))
     if DEBUG_INGESTION:
-        print(f"[ingest_articles_from_text] truncation done. Calling embedding_model.encode({len(texts)} texts)...")
-    vectors = embedding_model.encode(texts, normalize_embeddings=True)
+        print(f"[ingest_articles_from_text] truncation done. {len(texts)} texts to encode ({table_count} table chunks). Calling embedding_model.encode...")
+    if EMBED_BY_CHUNK and len(texts) > EMBED_BATCH_SIZE:
+        batch_vectors = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            end = min(start + EMBED_BATCH_SIZE, len(texts))
+            batch = texts[start:end]
+            batch_num = start // EMBED_BATCH_SIZE + 1
+            table_in_batch = [i for i in range(start, end) if i < len(payloads) and payloads[i].get("table")]
+            if DEBUG_INGESTION and table_in_batch:
+                print(f"[ingest_articles_from_text]   [encoding batch {batch_num}] payload indices {start}..{end-1}, TABLE count={len(table_in_batch)} at payload_idx: {table_in_batch}")
+                for idx in table_in_batch:
+                    t = texts[idx]
+                    preview = (t[:200] + "...") if len(t) > 200 else t
+                    print(f"[ingest_articles_from_text]     TABLE payload_idx={idx}: text_len={len(t)} preview={preview!r}")
+            if DEBUG_INGESTION and not table_in_batch:
+                print(f"[ingest_articles_from_text]   encoded batch {batch_num} ({len(batch)} texts, no tables)")
+            v = embedding_model.encode(batch, normalize_embeddings=True)
+            if hasattr(v, "numpy"):
+                v = v.numpy()
+            batch_vectors.append(v)
+            if DEBUG_INGESTION and table_in_batch:
+                print(f"[ingest_articles_from_text]   encoded batch {batch_num} done ({len(batch)} texts)")
+        vectors = np.concatenate(batch_vectors, axis=0)
+    else:
+        vectors = embedding_model.encode(texts, normalize_embeddings=True)
     if DEBUG_INGESTION:
         print(f"[ingest_articles_from_text] encode() returned. Converting to list...")
     if hasattr(vectors, "tolist"):
@@ -464,7 +774,7 @@ def ingest_articles_from_text(full_text: str, doc_id: str, source_label: str = "
         print(f"[ingest_articles_from_text] building {len(payloads)} points...")
     points = []
     for i, (payload, vec) in enumerate(zip(payloads, vectors)):
-        # Payload for Qdrant: type, segment_id, chunk_index for neighbor expansion
+        # Payload for Qdrant: type, segment_id, chunk_index; group_id for document paragraphs/tables (join at retrieval)
         p = {
             "doc_id": payload["doc_id"],
             "type": payload.get("type", "article"),
@@ -474,6 +784,12 @@ def ingest_articles_from_text(full_text: str, doc_id: str, source_label: str = "
             "total_chunks": payload["total_chunks"],
             "text": payload["text"],
         }
+        if "group_id" in payload:
+            p["group_id"] = payload["group_id"]
+        if payload.get("table"):
+            p["table"] = True
+            if "table_data" in payload and payload["table_data"] is not None:
+                p["table_data"] = payload["table_data"]
         if payload.get("source"):
             p["source"] = payload["source"]
         points.append(
@@ -507,9 +823,11 @@ def ensure_collection():
         print(f"  ⚠️  Collection check failed: {e}")
 
 
-def upload_docx(file_path: str) -> dict:
+def upload_docx(file_path: str, article_file: bool = False) -> dict:
     """
-    Read DOCX, treat as articles, chunk by tokens (500/50), embed with BGE-M3, upload to Qdrant.
+    Read DOCX and upload to Qdrant.
+    article_file=True: from data/articles – each article (1-modda, 2-modda) = one point.
+    article_file=False: from data/documents – normal chunking by token size.
     Returns {"ok": bool, "message": str, "filename": str, "chunks": int}.
     """
     filename = os.path.basename(file_path)
@@ -518,15 +836,27 @@ def upload_docx(file_path: str) -> dict:
         return {"ok": False, "message": "Skipping temporary file", "filename": filename, "chunks": 0}
 
     print(f"Processing: {file_path}")
-    try:
-        text = read_docx(file_path)
-    except Exception as e:
-        print(f"  ❌ Error reading {file_path}: {e}")
-        return {"ok": False, "message": str(e), "filename": filename, "chunks": 0}
-
-    if not text or len(text.strip()) < 50:
-        print(f"  ⚠️  Skipping {file_path}: document too short or empty")
-        return {"ok": False, "message": "Document too short or empty", "filename": filename, "chunks": 0}
+    if article_file:
+        try:
+            text = read_docx(file_path)
+        except Exception as e:
+            print(f"  ❌ Error reading {file_path}: {e}")
+            return {"ok": False, "message": str(e), "filename": filename, "chunks": 0}
+        if not text or len(text.strip()) < 50:
+            print(f"  ⚠️  Skipping {file_path}: document too short or empty")
+            return {"ok": False, "message": "Document too short or empty", "filename": filename, "chunks": 0}
+    else:
+        try:
+            elements = read_docx_elements(file_path)
+        except Exception as e:
+            print(f"  ❌ Error reading {file_path}: {e}")
+            return {"ok": False, "message": str(e), "filename": filename, "chunks": 0}
+        text_len = sum(len(el.get("text", "")) for el in elements if el.get("type") == "paragraph") + sum(
+            len(json.dumps(el.get("data", []), ensure_ascii=False)) for el in elements if el.get("type") == "table"
+        )
+        if not elements or text_len < 50:
+            print(f"  ⚠️  Skipping {file_path}: document too short or empty")
+            return {"ok": False, "message": "Document too short or empty", "filename": filename, "chunks": 0}
 
     try:
         file_hash = compute_file_hash(file_path)
@@ -541,7 +871,14 @@ def upload_docx(file_path: str) -> dict:
     doc_id = uuid.uuid4().hex
     source_label = filename
     try:
-        points = ingest_articles_from_text(text, doc_id=doc_id, source_label=source_label)
+        if article_file:
+            points = ingest_articles_from_text(
+                full_text=text, doc_id=doc_id, source_label=source_label, one_article_per_point=True
+            )
+        else:
+            points = ingest_articles_from_text(
+                doc_id=doc_id, source_label=source_label, one_article_per_point=False, elements=elements
+            )
     except Exception as e:
         print(f"  ❌ Error building points from {file_path}: {e}", file=sys.stderr)
         traceback.print_exc()
@@ -569,9 +906,11 @@ def upload_docx(file_path: str) -> dict:
     return {"ok": True, "message": f"Ingested {filename}", "filename": filename, "chunks": len(points)}
 
 
-def upload_file(file_path: str) -> dict:
+def upload_file(file_path: str, article_file: bool = False) -> dict:
     """
-    Ingest a single file (DOCX or TXT). Returns result dict with status and message.
+    Ingest a single file (DOCX or TXT).
+    article_file=True: from data/articles – each article (1-modda, 2-modda) = one point.
+    article_file=False: from data/documents – normal chunking.
     """
     filename = os.path.basename(file_path)
     if filename.startswith("~$") or filename.startswith("~"):
@@ -581,8 +920,7 @@ def upload_file(file_path: str) -> dict:
         return {"ok": False, "message": "File not found", "chunks": 0}
 
     if filename.endswith(".docx"):
-        result = upload_docx(file_path)
-        return result
+        return upload_docx(file_path, article_file=article_file)
     elif filename.endswith(".txt"):
         try:
             text = read_txt(file_path)
@@ -592,7 +930,9 @@ def upload_file(file_path: str) -> dict:
             if get_doc_id_by_hash(file_hash) is not None:
                 return {"ok": True, "skipped": True, "message": "Already ingested", "filename": filename, "chunks": 0}
             doc_id = uuid.uuid4().hex
-            points = ingest_articles_from_text(text, doc_id=doc_id, source_label=filename)
+            points = ingest_articles_from_text(
+                text, doc_id=doc_id, source_label=filename, one_article_per_point=article_file
+            )
             if not points:
                 return {"ok": False, "message": "No article points created", "filename": filename}
             ensure_collection()
@@ -687,45 +1027,68 @@ def upload_qa_file(file_path: str) -> dict:
 # -------------------------------
 # MAIN
 # -------------------------------
+def _list_doc_files(folder: str) -> list[str]:
+    """Return list of .docx and .txt paths in folder (non-recursive)."""
+    if not os.path.isdir(folder):
+        return []
+    paths = []
+    for name in os.listdir(folder):
+        if name.startswith("~$") or name.startswith("~"):
+            continue
+        if name.endswith(".docx") or name.endswith(".txt"):
+            paths.append(os.path.join(folder, name))
+    return paths
+
+
 if __name__ == "__main__":
     if not os.path.exists(DATA_FOLDER):
         print(f"❌ Error: Data folder '{DATA_FOLDER}' not found!")
         exit(1)
-    
-    # Filter: .docx, .txt, and .json (Q&A)
-    all_files = os.listdir(DATA_FOLDER)
-    doc_files = [
-        f for f in all_files
-        if (f.endswith(".docx") or f.endswith(".txt"))
-        and not f.startswith("~$")
-        and not f.startswith("~")
-    ]
-    qa_files = [f for f in all_files if f.endswith(".json") and not f.startswith("~")]
-    
-    if not doc_files and not qa_files:
-        print(f"⚠️  No .docx, .txt or .json (Q&A) files found in '{DATA_FOLDER}'")
+
+    # Articles: data/articles – each 1-modda, 2-modda = one point
+    article_files = _list_doc_files(DATA_ARTICLES_FOLDER)
+    # Documents: data/documents – normal chunking
+    document_files = _list_doc_files(DATA_DOCUMENTS_FOLDER)
+    # Q&A: data/*.json
+    qa_files = []
+    if os.path.isdir(DATA_FOLDER):
+        for name in os.listdir(DATA_FOLDER):
+            if name.endswith(".json") and not name.startswith("~"):
+                qa_files.append(os.path.join(DATA_FOLDER, name))
+
+    if not article_files and not document_files and not qa_files:
+        print(f"⚠️  No files in '{DATA_ARTICLES_FOLDER}', '{DATA_DOCUMENTS_FOLDER}' or Q&A in '{DATA_FOLDER}'")
         exit(0)
-    
-    print(f"📚 Found {len(doc_files)} doc(s) and {len(qa_files)} Q&A JSON(s)\n")
+
+    print(f"📚 Articles (1 modda = 1 point): {len(article_files)} | Documents (chunked): {len(document_files)} | Q&A: {len(qa_files)}\n")
     print("=" * 60)
 
     failed = []
-    for filename in doc_files:
-        file_path = os.path.join(DATA_FOLDER, filename)
-        result = upload_file(file_path)
+    for file_path in article_files:
+        result = upload_file(file_path, article_file=True)
         status = "✅" if result.get("ok") else "❌"
         chunks = result.get("chunks", 0)
-        print(f"{status} {filename}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
+        name = os.path.basename(file_path)
+        print(f"{status} [articles] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
         if not result.get("ok"):
-            failed.append((filename, result.get("message", "Unknown error")))
+            failed.append((name, result.get("message", "Unknown error")))
 
-    for filename in qa_files:
-        file_path = os.path.join(DATA_FOLDER, filename)
+    for file_path in document_files:
+        result = upload_file(file_path, article_file=False)
+        status = "✅" if result.get("ok") else "❌"
+        chunks = result.get("chunks", 0)
+        name = os.path.basename(file_path)
+        print(f"{status} [documents] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
+        if not result.get("ok"):
+            failed.append((name, result.get("message", "Unknown error")))
+
+    for file_path in qa_files:
         result = upload_qa_file(file_path)
         status = "✅" if result.get("ok") else "❌"
-        print(f"{status} Q&A {filename}: {result.get('message', '')} (count: {result.get('count', 0)})")
+        name = os.path.basename(file_path)
+        print(f"{status} Q&A {name}: {result.get('message', '')} (count: {result.get('count', 0)})")
         if not result.get("ok"):
-            failed.append((filename, result.get("message", "Unknown error")))
+            failed.append((name, result.get("message", "Unknown error")))
 
     print("=" * 60)
     if failed:
