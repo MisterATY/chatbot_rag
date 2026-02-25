@@ -459,29 +459,50 @@ def split_document_into_section_paragraphs(full_text: str) -> list[str]:
     return paragraphs
 
 
+def _dedupe_row_cells(row: list[str]) -> list[str]:
+    """
+    Return unique non-empty cell values in order (first occurrence kept).
+    Used for layout/org-chart tables where merged cells repeat the same value many times.
+    """
+    seen = set()
+    out = []
+    for c in row:
+        s = str(c).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def table_data_to_string(data: list[list[str]], fmt: str = "json") -> str:
     """
     Convert table rows to a single string for storage. fmt: "json" or "markdown".
-    Chunking will be done by token size so the string is not limited here.
+    Rows are deduplicated (unique non-empty values per row) to avoid storing repeated
+    values from merged cells / unstructured tables (e.g. org charts).
     """
+    if not data:
+        return "" if fmt == "markdown" else "[]"
+    deduped = [_dedupe_row_cells(row) for row in data]
+    deduped = [row for row in deduped if row]
+    if not deduped:
+        return "" if fmt == "markdown" else "[]"
     if fmt == "markdown":
-        if not data:
-            return ""
         lines = []
-        for i, row in enumerate(data):
-            cells = [str(c).replace("|", "\\|").replace("\n", " ") for c in row]
+        for i, row in enumerate(deduped):
+            cells = [c.replace("|", "\\|").replace("\n", " ") for c in row]
             lines.append("| " + " | ".join(cells) + " |")
             if i == 0:
                 lines.append("| " + " | ".join("---" for _ in row) + " |")
         return "\n".join(lines)
-    return json.dumps(data, ensure_ascii=False)
+    return json.dumps(deduped, ensure_ascii=False)
 
 
 def elements_to_blocks(elements: list[dict]) -> list[dict]:
     """
     Convert DOCX elements (paragraphs + tables) into blocks: section text blocks and table blocks.
     Section paragraphs are grouped by bob/bo'lim headers; each table is its own block with separate group_id.
-    Returns list of {"type": "section", "text": str} or {"type": "table", "data": list[list[str]]}.
+    Headings above a table (last 1–2 paragraphs before the table) are stored with the table in "heading".
+    Returns list of {"type": "section", "text": str} or {"type": "table", "data": ..., "heading": str}.
     """
     blocks = []
     section_lines = []
@@ -496,10 +517,15 @@ def elements_to_blocks(elements: list[dict]) -> list[dict]:
             else:
                 section_lines.append(line)
         elif el["type"] == "table":
+            heading_lines = []
+            if section_lines:
+                heading_lines = section_lines[-2:] if len(section_lines) >= 2 else section_lines[-1:]
+                section_lines = section_lines[: -len(heading_lines)]
             if section_lines:
                 blocks.append({"type": "section", "text": "\n\n".join(section_lines)})
                 section_lines = []
-            blocks.append({"type": "table", "data": el["data"]})
+            heading = "\n\n".join(heading_lines).strip() if heading_lines else ""
+            blocks.append({"type": "table", "data": el["data"], "heading": heading})
     if section_lines:
         blocks.append({"type": "section", "text": "\n\n".join(section_lines)})
     return blocks
@@ -569,11 +595,14 @@ def document_to_document_payloads(
                     })
         else:
             data = block["data"]
-            table_str = table_data_to_string(data, TABLE_STORE_FORMAT)
+            deduped_data = [row for row in (_dedupe_row_cells(r) for r in data) if row]
+            heading = block.get("heading", "").strip()
+            table_body = table_data_to_string(deduped_data, TABLE_STORE_FORMAT)
+            table_str = (heading + "\n\n" + table_body) if heading else table_body
             tokens = count_tokens(table_str)
-            num_rows = len(data)
+            num_rows = len(deduped_data)
             if DEBUG_INGESTION:
-                print(f"[document_to_document_payloads] [TABLE] rows={num_rows} tokens={tokens} format={TABLE_STORE_FORMAT} str_len={len(table_str)}")
+                print(f"[document_to_document_payloads] [TABLE] rows={num_rows} (deduped) tokens={tokens} format={TABLE_STORE_FORMAT} str_len={len(table_str)}")
             if tokens <= DOCUMENT_PARAGRAPH_CHUNK_SIZE:
                 if DEBUG_INGESTION:
                     print(f"[document_to_document_payloads]   -> single chunk group_id=-1 payload_idx={len(payloads)} (within chunk size)")
@@ -587,7 +616,7 @@ def document_to_document_payloads(
                     "group_id": -1,
                     "text": table_str,
                     "table": True,
-                    "table_data": data,
+                    "table_data": deduped_data,
                     "source": source_label,
                 })
             else:

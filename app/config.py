@@ -1,10 +1,10 @@
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 
-COLLECTION_NAME = "customs_chatbot_new"
+COLLECTION_NAME = "customs_chatbot_new3"
 
 # Embedding backend: "bge-m3" (BAAI/bge-m3), "qwen3" (Qwen3-Embedding-*)
-EMBEDDING_BACKEND = "qwen3"
+EMBEDDING_BACKEND = "bge-m3"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-4B"
 # Device for embedding: "cuda", "cpu", or None (auto: use cuda if available)
