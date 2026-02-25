@@ -1,0 +1,15 @@
+# Fix dependency conflict after upgrading torch to 2.10:
+# torchaudio and torchvision must match torch. Run ONE of the following.
+#
+# Option 1 - CUDA 12.1 (if you use GPU with cu121):
+#   pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# Option 2 - CUDA 12.4:
+#   pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu124
+#
+# Option 3 - CPU only:
+#   pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+#
+# Option 4 - Reinstall your previous stack (torch 2.5.1 + cu121) if you prefer not to upgrade:
+#   pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+#   (Then use GGUF embeddings or a safetensors model to avoid the torch.load restriction.)

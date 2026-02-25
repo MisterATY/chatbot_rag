@@ -1,7 +1,7 @@
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 
-COLLECTION_NAME = "customs_chatbot_new3"
+COLLECTION_NAME = "customs_chatbot"
 
 # Embedding backend: "bge-m3" (BAAI/bge-m3), "qwen3" (Qwen3-Embedding-*)
 EMBEDDING_BACKEND = "bge-m3"
