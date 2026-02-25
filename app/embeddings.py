@@ -62,20 +62,21 @@ def _get_embedding_model():
         return _QwenGGUFWrapper()
     import torch
     device = _embedding_device()
-    if EMBEDDING_BACKEND == "qwen3":
+    # Prefer safetensors to avoid torch.load (requires torch>=2.6 for .bin weights; CVE-2025-32434)
+    model_kwargs = {"low_cpu_mem_usage": True, "use_safetensors": True}
+    model_name = QWEN_EMBEDDING_MODEL if EMBEDDING_BACKEND == "qwen3" else EMBEDDING_MODEL
+    try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(
-            QWEN_EMBEDDING_MODEL,
-            device=device,
-            model_kwargs={"low_cpu_mem_usage": True},
-        )
-    else:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            device=device,
-            model_kwargs={"low_cpu_mem_usage": True},
-        )
+        model = SentenceTransformer(model_name, device=device, model_kwargs=model_kwargs)
+    except ValueError as e:
+        if "torch to at least v2.6" in str(e) or "safetensors" in str(e).lower():
+            raise RuntimeError(
+                "Embedding model loading failed due to torch.load security restriction. "
+                "Either: (1) Upgrade torch: pip install 'torch>=2.6', or "
+                "(2) Use a model that has safetensors weights on the Hub, or "
+                "(3) Use GGUF: set QWEN_EMBEDDING_GGUF_PATH in config to a .gguf file and EMBEDDING_BACKEND='qwen3'."
+            ) from e
+        raise
     # Force model onto device (some versions load on CPU first)
     device_obj = torch.device(device)
     model = model.to(device_obj)
