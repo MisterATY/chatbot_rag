@@ -652,7 +652,43 @@ def document_to_article_payloads(
         tokens = count_tokens(text)
         debug_label = f"art_{art_idx} {title!r}"
 
-        if one_article_per_point or tokens <= ARTICLE_MAX_SINGLE_POINT_TOKENS:
+        if one_article_per_point:
+            if tokens <= ARTICLE_CHUNK_SIZE_TOKENS:
+                if DEBUG_INGESTION:
+                    print(f"  [article {art_idx}] title={title!r} tokens={tokens} -> SINGLE_CHUNK group_id=-1")
+                payloads.append({
+                    "doc_id": doc_id,
+                    "type": content_type,
+                    "segment_id": segment_id,
+                    "title": title,
+                    "chunk_index": len(payloads),
+                    "total_chunks": 0,
+                    "group_id": -1,
+                    "text": text,
+                    "source": source_label,
+                })
+            else:
+                if DEBUG_INGESTION:
+                    print(f"  [article {art_idx}] title={title!r} tokens={tokens} -> CHUNKING group_id={art_idx}")
+                chunks = chunk_article_by_tokens(
+                    text,
+                    chunk_size=ARTICLE_CHUNK_SIZE_TOKENS,
+                    overlap=ARTICLE_CHUNK_OVERLAP_TOKENS,
+                    debug_label=debug_label,
+                )
+                for chunk_text in chunks:
+                    payloads.append({
+                        "doc_id": doc_id,
+                        "type": content_type,
+                        "segment_id": segment_id,
+                        "title": title,
+                        "chunk_index": len(payloads),
+                        "total_chunks": 0,
+                        "group_id": art_idx,
+                        "text": chunk_text,
+                        "source": source_label,
+                    })
+        elif tokens <= ARTICLE_MAX_SINGLE_POINT_TOKENS:
             if DEBUG_INGESTION:
                 print(f"  [article {art_idx}] title={title!r} tokens={tokens} -> SINGLE_POINT")
             payloads.append({
@@ -674,14 +710,14 @@ def document_to_article_payloads(
                 overlap=ARTICLE_CHUNK_OVERLAP_TOKENS,
                 debug_label=debug_label,
             )
-            for chunk_idx, chunk_text in enumerate(chunks):
+            for chunk_text in chunks:
                 payloads.append({
                     "doc_id": doc_id,
                     "type": content_type,
                     "segment_id": segment_id,
                     "title": title,
-                    "chunk_index": chunk_idx,
-                    "total_chunks": len(chunks),
+                    "chunk_index": len(payloads),
+                    "total_chunks": 0,
                     "text": chunk_text,
                     "source": source_label,
                 })

@@ -54,15 +54,16 @@ def _is_question_answerable(payload: dict) -> bool:
     return isinstance(payload, dict) and payload.get("type") == "qa"
 
 
-def _fetch_and_join_document_group(doc_id: str, group_id: int) -> str:
+def _fetch_and_join_group(doc_id: str, group_id: int, content_type: str) -> str:
     """
-    Fetch all chunks with the same (doc_id, group_id) from Qdrant, sort by chunk_index.
-    For paragraphs: join text. For tables: merge table_data (rows) and return JSON string.
+    Gather group members using scroll (doc_id + group_id + type), sort by chunk_index, join into single block.
+    content_type: "document" or "article". For document: join text or merge table_data. For article: join text.
     """
     filter_ = Filter(
         must=[
             FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
             FieldCondition(key="group_id", match=MatchValue(value=group_id)),
+            FieldCondition(key="type", match=MatchValue(value=content_type)),
         ]
     )
     points, _ = client.scroll(
@@ -73,9 +74,9 @@ def _fetch_and_join_document_group(doc_id: str, group_id: int) -> str:
         limit=100,
     )
     payloads = [_payload_from_hit(p) for p in points]
-    payloads = [p for p in payloads if p.get("type") == "document" and p.get("group_id") == group_id]
+    payloads = [p for p in payloads if p.get("type") == content_type and p.get("group_id") == group_id]
     payloads.sort(key=lambda p: p.get("chunk_index", 0))
-    if payloads and payloads[0].get("table"):
+    if content_type == "document" and payloads and payloads[0].get("table"):
         if all(p.get("table_data") is not None for p in payloads):
             merged_rows = []
             for p in payloads:
@@ -350,8 +351,8 @@ def retrieve(
             block = f"[Article – – Part 1/1]\n{text}"
         return [block]
 
-    # Build block items in reranked order: each item is a group (scroll by group_id) or a single chunk.
-    # Grouped points (doc_id, group_id) are gathered via scroll and joined into one block.
+    # Build block items in reranked order: each item is a group (scroll by group_id + type) or a single chunk.
+    # Grouped points (doc_id, group_id) are gathered via scroll and joined into one block (document or article).
     block_items = []
     seen_groups = set()
 
@@ -360,15 +361,12 @@ def retrieve(
         if not _is_document_or_article_chunk(pl):
             block_items.append(("single", pl))
             continue
-        if (
-            pl.get("type") == "document"
-            and pl.get("group_id") is not None
-            and pl.get("group_id") != -1
-        ):
-            dg = (pl.get("doc_id", ""), pl.get("group_id"))
+        content_type = pl.get("type", "document")
+        if content_type in ("document", "article") and pl.get("group_id") is not None and pl.get("group_id") != -1:
+            dg = (pl.get("doc_id", ""), pl.get("group_id"), content_type)
             if dg not in seen_groups:
                 seen_groups.add(dg)
-                block_items.append(("group", pl.get("doc_id", ""), pl.get("group_id")))
+                block_items.append(("group", pl.get("doc_id", ""), pl.get("group_id"), content_type))
             continue
         if i == 0 and pl.get("total_chunks", 1) > 1:
             block_items.append(("article_neighbor", pl))
@@ -379,8 +377,8 @@ def retrieve(
     for idx, item in enumerate(block_items):
         block_num = idx + 1
         if item[0] == "group":
-            _, doc_id, group_id = item
-            joined = _fetch_and_join_document_group(doc_id, group_id)
+            _, doc_id, group_id, content_type = item
+            joined = _fetch_and_join_group(doc_id, group_id, content_type)
             context_blocks.append(f"Context {block_num}: \n{joined}")
         elif item[0] == "article_neighbor":
             _, pl = item
