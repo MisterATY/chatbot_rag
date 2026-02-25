@@ -3,7 +3,15 @@ import re
 import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
-from app.config import QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, LLM_SERVER_URL, LLM_MODEL
+from app.config import (
+    QDRANT_HOST,
+    QDRANT_PORT,
+    COLLECTION_NAME,
+    LLM_SERVER_URL,
+    LLM_MODEL,
+    DEFAULT_LANG,
+    LANGUAGES,
+)
 from app.embeddings import embedding_model
 from app.tokenizer_util import count_tokens, get_tokenizer
 from app.reranker import rerank
@@ -294,15 +302,26 @@ def retrieve(
     query: str,
     top_k: int = RETRIEVAL_TOP_K,
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
+    lang: str = DEFAULT_LANG,
 ) -> list[str]:
     """
     Retrieve context for RAG.
     """
     query_vector = embedding_model.encode(query, normalize_embeddings=True).tolist()
 
+    # Normalize/validate language
+    lang = (lang or DEFAULT_LANG).strip()
+    if lang not in LANGUAGES:
+        lang = DEFAULT_LANG
+
+    lang_filter = Filter(
+        must=[FieldCondition(key="lang", match=MatchValue(value=lang))]
+    )
+
     results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
+        query_filter=lang_filter,
         limit=top_k,
         with_payload=True,
     )
@@ -310,19 +329,18 @@ def retrieve(
     if not points:
         return []
 
-    # Rerank found points before proceeding
-    texts = [_payload_from_hit(p).get("text", "") for p in points]
-    reranked_texts = rerank(query, texts, top_n=7)
-    # Reorder points to match reranked order (best first)
-    pairs = list(zip(points, texts))
-    points_reranked = []
-    for t in reranked_texts:
-        for j, (pt, tx) in enumerate(pairs):
-            if tx == t:
-                points_reranked.append(pt)
-                del pairs[j]
-                break
-    points = points_reranked
+    # Reranking disabled: keep points in query order (best first)
+    # texts = [_payload_from_hit(p).get("text", "") for p in points]
+    # reranked_texts = rerank(query, texts, top_n=7)
+    # pairs = list(zip(points, texts))
+    # points_reranked = []
+    # for t in reranked_texts:
+    #     for j, (pt, tx) in enumerate(pairs):
+    #         if tx == t:
+    #             points_reranked.append(pt)
+    #             del pairs[j]
+    #             break
+    # points = points_reranked
 
     best = points[0]
     best_payload = _payload_from_hit(best)
@@ -485,12 +503,13 @@ def retrieve_and_answer(
     query: str,
     top_k: int = RETRIEVAL_TOP_K,
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
+    lang: str = DEFAULT_LANG,
 ) -> dict:
     """
     Complete RAG pipeline: retrieve with neighbor expansion, assemble context, get LLM answer.
     Returns dict with 'context' (list of formatted blocks) and 'answer'.
     """
-    context = retrieve(query, top_k=top_k, max_context_tokens=max_context_tokens)
+    context = retrieve(query, top_k=top_k, max_context_tokens=max_context_tokens, lang=lang)
     answer = query_llm(query, context)
     return {"context": context, "answer": answer}
 

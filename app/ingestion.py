@@ -12,7 +12,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from app.qdrant_db import client
 from app.embeddings import embedding_model
-from app.config import COLLECTION_NAME, VECTOR_SIZE
+from app.config import COLLECTION_NAME, VECTOR_SIZE, DEFAULT_LANG, LANGUAGES
 from app.tokenizer_util import count_tokens, get_tokenizer, MAX_MODEL_TOKENS
 from app.file_registry import compute_file_hash, get_doc_id_by_hash, register_file
 from qdrant_client.models import PointStruct, VectorParams, Distance
@@ -764,6 +764,7 @@ def ingest_articles_from_text(
     source_label: str = "",
     one_article_per_point: bool = False,
     elements: list[dict] | None = None,
+    lang: str = DEFAULT_LANG,
 ) -> list[PointStruct]:
     """
     Build Qdrant points (with vectors) from document text or DOCX elements.
@@ -849,6 +850,7 @@ def ingest_articles_from_text(
             "total_chunks": payload["total_chunks"],
             "text": payload["text"],
         }
+        p["lang"] = lang or DEFAULT_LANG
         if "group_id" in payload:
             p["group_id"] = payload["group_id"]
         if payload.get("table"):
@@ -888,7 +890,7 @@ def ensure_collection():
         print(f"  ⚠️  Collection check failed: {e}")
 
 
-def upload_docx(file_path: str, article_file: bool = False) -> dict:
+def upload_docx(file_path: str, article_file: bool = False, lang: str = DEFAULT_LANG) -> dict:
     """
     Read DOCX and upload to Qdrant.
     article_file=True: from data/articles – each article (1-modda, 2-modda) = one point.
@@ -938,11 +940,11 @@ def upload_docx(file_path: str, article_file: bool = False) -> dict:
     try:
         if article_file:
             points = ingest_articles_from_text(
-                full_text=text, doc_id=doc_id, source_label=source_label, one_article_per_point=True
+                full_text=text, doc_id=doc_id, source_label=source_label, one_article_per_point=True, lang=lang
             )
         else:
             points = ingest_articles_from_text(
-                doc_id=doc_id, source_label=source_label, one_article_per_point=False, elements=elements
+                doc_id=doc_id, source_label=source_label, one_article_per_point=False, elements=elements, lang=lang
             )
     except Exception as e:
         print(f"  ❌ Error building points from {file_path}: {e}", file=sys.stderr)
@@ -971,7 +973,7 @@ def upload_docx(file_path: str, article_file: bool = False) -> dict:
     return {"ok": True, "message": f"Ingested {filename}", "filename": filename, "chunks": len(points)}
 
 
-def upload_file(file_path: str, article_file: bool = False) -> dict:
+def upload_file(file_path: str, article_file: bool = False, lang: str = DEFAULT_LANG) -> dict:
     """
     Ingest a single file (DOCX or TXT).
     article_file=True: from data/articles – each article (1-modda, 2-modda) = one point.
@@ -985,7 +987,7 @@ def upload_file(file_path: str, article_file: bool = False) -> dict:
         return {"ok": False, "message": "File not found", "chunks": 0}
 
     if filename.endswith(".docx"):
-        return upload_docx(file_path, article_file=article_file)
+        return upload_docx(file_path, article_file=article_file, lang=lang)
     elif filename.endswith(".txt"):
         try:
             text = read_txt(file_path)
@@ -996,7 +998,7 @@ def upload_file(file_path: str, article_file: bool = False) -> dict:
                 return {"ok": True, "skipped": True, "message": "Already ingested", "filename": filename, "chunks": 0}
             doc_id = uuid.uuid4().hex
             points = ingest_articles_from_text(
-                text, doc_id=doc_id, source_label=filename, one_article_per_point=article_file
+                text, doc_id=doc_id, source_label=filename, one_article_per_point=article_file, lang=lang
             )
             if not points:
                 return {"ok": False, "message": "No article points created", "filename": filename}
@@ -1016,6 +1018,7 @@ def upload_file(file_path: str, article_file: bool = False) -> dict:
 def upload_qa_from_data(
     pairs: list[dict],
     source: str = "qa",
+    lang: str = DEFAULT_LANG,
 ) -> dict:
     """
     Ingest question-answer pairs.
@@ -1055,7 +1058,7 @@ def upload_qa_from_data(
                     "answer": a,
                     "source": source,
                     "type": "qa",
-                    "language": "uzbek",
+                    "lang": lang,
                 },
             )
         )
@@ -1068,7 +1071,7 @@ def upload_qa_from_data(
         return {"ok": False, "message": str(e), "count": 0}
 
 
-def upload_qa_file(file_path: str) -> dict:
+def upload_qa_file(file_path: str, lang: str = DEFAULT_LANG) -> dict:
     """Load Q&A JSON from file and ingest into the same collection."""
     if not os.path.exists(file_path):
         return {"ok": False, "message": "File not found", "count": 0}
@@ -1086,7 +1089,7 @@ def upload_qa_file(file_path: str) -> dict:
     else:
         pairs = data.get("pairs") or data.get("qa") or []
         source = data.get("source") or os.path.basename(file_path)
-    return upload_qa_from_data(pairs=pairs, source=source)
+    return upload_qa_from_data(pairs=pairs, source=source, lang=lang)
 
 
 # -------------------------------
@@ -1110,55 +1113,77 @@ if __name__ == "__main__":
         print(f"❌ Error: Data folder '{DATA_FOLDER}' not found!")
         exit(1)
 
-    # Articles: data/articles – each 1-modda, 2-modda = one point
-    article_files = _list_doc_files(DATA_ARTICLES_FOLDER)
-    # Documents: data/documents – normal chunking
-    document_files = _list_doc_files(DATA_DOCUMENTS_FOLDER)
-    # Q&A: data/*.json
-    qa_files = []
-    if os.path.isdir(DATA_FOLDER):
-        for name in os.listdir(DATA_FOLDER):
-            if name.endswith(".json") and not name.startswith("~"):
-                qa_files.append(os.path.join(DATA_FOLDER, name))
+    # Detect per-language subfolders: data/<lang>/{articles,documents,*.json}
+    lang_dirs = [lang for lang in LANGUAGES if os.path.isdir(os.path.join(DATA_FOLDER, lang))]
 
-    if not article_files and not document_files and not qa_files:
-        print(f"⚠️  No files in '{DATA_ARTICLES_FOLDER}', '{DATA_DOCUMENTS_FOLDER}' or Q&A in '{DATA_FOLDER}'")
-        exit(0)
-
-    print(f"📚 Articles (1 modda = 1 point): {len(article_files)} | Documents (chunked): {len(document_files)} | Q&A: {len(qa_files)}\n")
-    print("=" * 60)
+    # Fallback to legacy single-language layout if no lang subfolders exist
+    if not lang_dirs:
+        lang_dirs = [DEFAULT_LANG]
+        base_articles = DATA_ARTICLES_FOLDER
+        base_documents = DATA_DOCUMENTS_FOLDER
+        base_qa_root = DATA_FOLDER
+        lang_roots = {DEFAULT_LANG: (base_articles, base_documents, base_qa_root)}
+    else:
+        lang_roots = {}
+        for lang in lang_dirs:
+            root = os.path.join(DATA_FOLDER, lang)
+            lang_roots[lang] = (
+                os.path.join(root, "articles"),
+                os.path.join(root, "documents"),
+                root,
+            )
 
     failed = []
-    for file_path in article_files:
-        result = upload_file(file_path, article_file=True)
-        status = "✅" if result.get("ok") else "❌"
-        chunks = result.get("chunks", 0)
-        name = os.path.basename(file_path)
-        print(f"{status} [articles] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
-        if not result.get("ok"):
-            failed.append((name, result.get("message", "Unknown error")))
 
-    for file_path in document_files:
-        result = upload_file(file_path, article_file=False)
-        status = "✅" if result.get("ok") else "❌"
-        chunks = result.get("chunks", 0)
-        name = os.path.basename(file_path)
-        print(f"{status} [documents] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
-        if not result.get("ok"):
-            failed.append((name, result.get("message", "Unknown error")))
+    for lang in lang_dirs:
+        articles_dir, documents_dir, qa_root = lang_roots[lang]
+        article_files = _list_doc_files(articles_dir)
+        document_files = _list_doc_files(documents_dir)
+        qa_files = []
+        if os.path.isdir(qa_root):
+            for name in os.listdir(qa_root):
+                if name.endswith(".json") and not name.startswith("~"):
+                    qa_files.append(os.path.join(qa_root, name))
 
-    for file_path in qa_files:
-        result = upload_qa_file(file_path)
-        status = "✅" if result.get("ok") else "❌"
-        name = os.path.basename(file_path)
-        print(f"{status} Q&A {name}: {result.get('message', '')} (count: {result.get('count', 0)})")
-        if not result.get("ok"):
-            failed.append((name, result.get("message", "Unknown error")))
+        if not article_files and not document_files and not qa_files:
+            print(f"⚠️  No files for lang='{lang}' in '{articles_dir}', '{documents_dir}' or Q&A in '{qa_root}'")
+            continue
 
-    print("=" * 60)
+        print(
+            f"\n=== Language: {lang} | Articles: {len(article_files)} | "
+            f"Documents: {len(document_files)} | Q&A: {len(qa_files)} ==="
+        )
+
+        for file_path in article_files:
+            result = upload_file(file_path, article_file=True, lang=lang)
+            status = "✅" if result.get("ok") else "❌"
+            chunks = result.get("chunks", 0)
+            name = os.path.basename(file_path)
+            print(f"{status} [articles] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
+            if not result.get("ok"):
+                failed.append((lang, name, result.get("message", "Unknown error")))
+
+        for file_path in document_files:
+            result = upload_file(file_path, article_file=False, lang=lang)
+            status = "✅" if result.get("ok") else "❌"
+            chunks = result.get("chunks", 0)
+            name = os.path.basename(file_path)
+            print(f"{status} [documents] {name}: {result.get('message', '')}" + (f" ({chunks} chunks)" if chunks else ""))
+            if not result.get("ok"):
+                failed.append((lang, name, result.get("message", "Unknown error")))
+
+        for file_path in qa_files:
+            result = upload_qa_file(file_path, lang=lang)
+            status = "✅" if result.get("ok") else "❌"
+            name = os.path.basename(file_path)
+            print(f"{status} Q&A {name}: {result.get('message', '')} (count: {result.get('count', 0)})")
+            if not result.get("ok"):
+                failed.append((lang, name, result.get("message", "Unknown error")))
+
+    print("\n" + "=" * 60)
     if failed:
         print("❌ Some files failed:")
-        for name, msg in failed:
-            print(f"   - {name}: {msg}")
+        for lang, name, msg in failed:
+            print(f"   - [{lang}] {name}: {msg}")
         exit(1)
     print("✅ All files processed successfully!")

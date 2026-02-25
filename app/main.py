@@ -31,6 +31,7 @@ class AskRequest(BaseModel):
     query: str = Field(..., description="Question to answer using RAG")
     top_k: int = Field(12, ge=1, le=50, description="Number of chunks to retrieve from Qdrant")
     max_context_tokens: int = Field(3500, ge=500, le=8000, description="Max tokens in assembled context for LLM")
+    lang: Optional[str] = Field("oz", description="Language code: oz (default), uz, ru, en")
 
 
 class AskResponse(BaseModel):
@@ -84,6 +85,7 @@ def ask_get(
     query: str = Query(..., description="Question to answer"),
     top_k: int = Query(12, ge=1, le=50),
     max_context_tokens: int = Query(3500, ge=500, le=8000),
+    lang: str = Query("oz", description="Language code: oz (default), uz, ru, en"),
 ):
     """Get an answer to a question using RAG (GET)."""
     if not query or not query.strip():
@@ -92,6 +94,7 @@ def ask_get(
         query=query.strip(),
         top_k=top_k,
         max_context_tokens=max_context_tokens,
+        lang=lang,
     )
     return AskResponse(
         answer=result["answer"],
@@ -109,6 +112,7 @@ def ask_post(body: AskRequest):
         query=body.query.strip(),
         top_k=body.top_k,
         max_context_tokens=body.max_context_tokens,
+        lang=(body.lang or "oz"),
     )
     return AskResponse(
         answer=result["answer"],
