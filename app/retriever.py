@@ -534,7 +534,7 @@ Rules:
    "Sizning savolingizga javob berish uchun yetarlicha bilimga ega emasman!"
 6. Never make assumptions or fabricate information.
 7. Write the answer in as much detail as possible, clearly, thoroughly, and in a formal style.
-8. The answer must be written ONLY in the {language_name} language.
+8. The answer must be written ONLY in the user question language.
 
 Your task is to provide a reliable, context-based answer to the given question."""
             },
@@ -546,7 +546,7 @@ Your task is to provide a reliable, context-based answer to the given question."
         "max_tokens": 4096,
         "stream": False,
         "model": "bojxona3-14b.gguf",
-        "temperature": 0.7
+        "temperature": 0.4
     }
     # 6. Javobni aniq, qisqa va rasmiy-uslubda yozing.
     try:
@@ -578,19 +578,19 @@ def retrieve_and_answer(
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
 ) -> dict:
     """
-    Complete RAG pipeline: detect language from question, normalize Uzbek Cyrillic to Latin,
-    retrieve context, then get LLM answer in the detected language (uz, ru, en).
+    Complete RAG pipeline: retrieve context, get LLM answer.
+    Language detection and Cyrillic→Latin conversion are disabled for now.
     Returns dict with 'context' (list of formatted blocks) and 'answer'.
     """
     raw_query = (query or "").strip()
     if not raw_query:
         return {"context": [], "answer": ""}
 
-    answer_lang = detect_answer_language(raw_query)
-    query_normalized = normalize_query_language(raw_query, answer_lang)
-
-    context = retrieve(query_normalized, top_k=top_k, max_context_tokens=max_context_tokens)
-    answer = query_llm(query_normalized, context, answer_lang=answer_lang)
+    # Language detection and converting to Latin disabled
+    # answer_lang = detect_answer_language(raw_query)
+    # query_normalized = normalize_query_language(raw_query, answer_lang)
+    context = retrieve(raw_query, top_k=top_k, max_context_tokens=max_context_tokens)
+    answer = query_llm(raw_query, context, answer_lang="uz")
     return {"context": context, "answer": answer}
 
 
