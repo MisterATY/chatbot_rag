@@ -20,6 +20,8 @@ transformers>=4.57.0
 # Utilities
 numpy>=1.24.0
 requests>=2.28.0
+fasttext-wheel==0.9.2
+requests==2.32.5
 
 # DOCX / TXT ingestion
 python-docx>=1.0.0

@@ -1,12 +1,7 @@
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 
-COLLECTION_NAME = "customs_chatbot_lang"
-
-# Languages
-# Supported language codes: "oz" (Uzbek Latin, default), "uz" (Uzbek Cyrillic), "ru", "en"
-LANGUAGES = ["oz", "uz", "ru", "en"]
-DEFAULT_LANG = "oz"
+COLLECTION_NAME = "customs_chatbot_new"
 
 # Embedding backend: "bge-m3", "qwen3", or "remote" (HTTP embed server)
 EMBEDDING_BACKEND = "remote"

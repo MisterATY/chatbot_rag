@@ -9,13 +9,26 @@ from app.config import (
     COLLECTION_NAME,
     LLM_SERVER_URL,
     LLM_MODEL,
-    DEFAULT_LANG,
-    LANGUAGES,
 )
 from app.embeddings import embedding_model
 from app.tokenizer_util import count_tokens, get_tokenizer
-from app.reranker import rerank
+# from app.reranker import rerank
 import numpy as np
+
+# NumPy 2.x: fasttext uses np.array(..., copy=False) which can raise ValueError.
+# Patch np.array so that when copy=False fails we use np.asarray (same semantics).
+_np_array_orig = np.array
+def _np_array_numpy2_compat(object, *args, copy=True, **kwargs):
+    try:
+        return _np_array_orig(object, *args, copy=copy, **kwargs)
+    except ValueError:
+        if not copy:
+            return np.asarray(object, *args, **kwargs)
+        raise
+np.array = _np_array_numpy2_compat
+
+import fasttext
+import os
 
 # -------------------------------
 # SETUP
@@ -27,6 +40,71 @@ RETRIEVAL_TOP_K = 12
 MAX_CONTEXT_TOKENS = 25000
 NEIGHBOR_CHUNKS_BEFORE = 2
 NEIGHBOR_CHUNKS_AFTER = 2
+
+# Allowed answer languages (retriever-only); used for prompt rule 8
+ALLOWED_ANSWER_LANGUAGES = ("uz", "ru", "en")
+LANGUAGE_NAMES = {"uz": "Uzbek", "ru": "Russian", "en": "English"}
+LANGUAGE_DETECTION_MODEL_PATH = r"../../models/lid.176.bin"
+
+# Uzbek Cyrillic → Latin (official 1995 mapping; simple 1:1 for Е→e)
+_UZBEK_CYRILLIC_TO_LATIN = str.maketrans({
+    "А": "A", "а": "a", "Б": "B", "б": "b", "В": "V", "в": "v", "Г": "G", "г": "g",
+    "Д": "D", "д": "d", "Е": "E", "е": "e", "Ё": "Yo", "ё": "yo", "Ж": "J", "ж": "j",
+    "З": "Z", "з": "z", "И": "I", "и": "i", "Й": "Y", "й": "y", "К": "K", "к": "k",
+    "Л": "L", "л": "l", "М": "M", "м": "m", "Н": "N", "н": "n", "О": "O", "о": "o",
+    "П": "P", "п": "p", "Р": "R", "р": "r", "С": "S", "с": "s", "Т": "T", "т": "t",
+    "У": "U", "у": "u", "Ф": "F", "ф": "f", "Х": "X", "х": "x", "Ц": "Ts", "ц": "ts",
+    "Ч": "Ch", "ч": "ch", "Ш": "Sh", "ш": "sh", "Щ": "Sh", "щ": "sh", "Ъ": "'", "ъ": "'",
+    "Ы": "I", "ы": "i", "Ь": "'", "ь": "'", "Э": "E", "э": "e", "Ю": "Yu", "ю": "yu",
+    "Я": "Ya", "я": "ya", "Ў": "Oʻ", "ў": "oʻ", "Қ": "Q", "қ": "q", "Ғ": "Gʻ", "ғ": "gʻ",
+    "Ҳ": "H", "ҳ": "h",
+})
+
+
+# -------------------------------
+# LANGUAGE DETECTION (retriever only)
+# -------------------------------
+def detect_answer_language(query: str) -> str:
+    """
+    Detect language from the question. Returns one of uz, ru, en.
+    Defaults to "uz" if detection fails or language is not allowed.
+    """
+    text = (query or "").strip()
+    if not text:
+        return "uz"
+    try:
+        model = fasttext.load_model(LANGUAGE_DETECTION_MODEL_PATH)
+        labels, _ = model.predict(text)
+        code = (labels[0] or "").replace("__label__", "").lower()[:2]
+        if code in ALLOWED_ANSWER_LANGUAGES:
+            return code
+    except Exception:
+        pass
+    return "uz"
+
+
+def _has_cyrillic(text: str) -> bool:
+    """True if text contains at least one Cyrillic letter."""
+    return bool(re.search(r"[\u0400-\u04FF]", text))
+
+
+def uzbek_cyrillic_to_latin(text: str) -> str:
+    """Convert Uzbek Cyrillic to Uzbek Latin. Non-Cyrillic unchanged."""
+    if not text:
+        return text
+    return text.translate(_UZBEK_CYRILLIC_TO_LATIN)
+
+
+def normalize_query_language(query: str, detected_lang: str) -> str:
+    """
+    If the question is Uzbek in Cyrillic script, normalize to Uzbek Latin.
+    Otherwise return query unchanged.
+    """
+    if detected_lang != "uz":
+        return query
+    if not _has_cyrillic(query):
+        return query
+    return uzbek_cyrillic_to_latin(query)
 
 
 # -------------------------------
@@ -302,26 +380,15 @@ def retrieve(
     query: str,
     top_k: int = RETRIEVAL_TOP_K,
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
-    lang: str = DEFAULT_LANG,
 ) -> list[str]:
     """
-    Retrieve context for RAG.
+    Retrieve context for RAG (no language filter; BGE-M3 gives same semantics across uz/en/ru).
     """
     query_vector = embedding_model.encode(query, normalize_embeddings=True).tolist()
-
-    # Normalize/validate language
-    lang = (lang or DEFAULT_LANG).strip()
-    if lang not in LANGUAGES:
-        lang = DEFAULT_LANG
-
-    lang_filter = Filter(
-        must=[FieldCondition(key="lang", match=MatchValue(value=lang))]
-    )
 
     results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
-        query_filter=lang_filter,
         limit=top_k,
         with_payload=True,
     )
@@ -424,11 +491,17 @@ def retrieve(
 # -------------------------------
 # LLM INTEGRATION
 # -------------------------------
-def query_llm(query: str, context: list[str]) -> str:
+def query_llm(query: str, context: list[str], answer_lang: str = "uz") -> str:
     """
     Send query and context to LLM server and get response.
     context: list of formatted blocks from retrieve() (Article – title – Part x/y + text).
+    answer_lang: one of uz, ru, en; forces rule 8 to that language.
     """
+    answer_lang = (answer_lang or "uz").strip().lower()
+    if answer_lang not in ALLOWED_ANSWER_LANGUAGES:
+        answer_lang = "en"
+    language_name = LANGUAGE_NAMES.get(answer_lang, "English")
+
     context_text = "\n\n".join(context) if context else ""
 
     # Format the prompt with context
@@ -461,7 +534,7 @@ Rules:
    "Sizning savolingizga javob berish uchun yetarlicha bilimga ega emasman!"
 6. Never make assumptions or fabricate information.
 7. Write the answer in as much detail as possible, clearly, thoroughly, and in a formal style.
-8. The answer must be written ONLY in the Uzbek language.
+8. The answer must be written ONLY in the {language_name} language.
 
 Your task is to provide a reliable, context-based answer to the given question."""
             },
@@ -503,14 +576,21 @@ def retrieve_and_answer(
     query: str,
     top_k: int = RETRIEVAL_TOP_K,
     max_context_tokens: int = MAX_CONTEXT_TOKENS,
-    lang: str = DEFAULT_LANG,
 ) -> dict:
     """
-    Complete RAG pipeline: retrieve with neighbor expansion, assemble context, get LLM answer.
+    Complete RAG pipeline: detect language from question, normalize Uzbek Cyrillic to Latin,
+    retrieve context, then get LLM answer in the detected language (uz, ru, en).
     Returns dict with 'context' (list of formatted blocks) and 'answer'.
     """
-    context = retrieve(query, top_k=top_k, max_context_tokens=max_context_tokens, lang=lang)
-    answer = query_llm(query, context)
+    raw_query = (query or "").strip()
+    if not raw_query:
+        return {"context": [], "answer": ""}
+
+    answer_lang = detect_answer_language(raw_query)
+    query_normalized = normalize_query_language(raw_query, answer_lang)
+
+    context = retrieve(query_normalized, top_k=top_k, max_context_tokens=max_context_tokens)
+    answer = query_llm(query_normalized, context, answer_lang=answer_lang)
     return {"context": context, "answer": answer}
 
 

@@ -1,7 +1,10 @@
 /old_data/
+/old_data
+/old_data/*
 /data/
 /app/__pycache__/
 
 # Local config (secrets, paths); if already tracked, run: git rm --cached app/config.py
 app/config.py
 /config.py
+/venv
